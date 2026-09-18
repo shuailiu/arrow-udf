@@ -16,7 +16,10 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Int32Array, RecordBatch, RecordBatchOptions, StringArray};
+use arrow_array::{
+    Array, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, RecordBatchOptions,
+    StringArray, UInt64Array,
+};
 use arrow_cast::pretty::pretty_format_batches;
 use arrow_schema::{DataType, Field, Fields, Schema};
 use arrow_udf_runtime::wasm::Runtime;
@@ -52,7 +55,6 @@ fn test_oom() {
 }
 
 #[test]
-#[ignore = "FIXME: sleep should not be allowed"]
 fn test_sleep() {
     let input = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, true)])),
@@ -159,6 +161,234 @@ fn test_length() {
         | 4      |
         +--------+"#]],
     );
+}
+
+#[test]
+fn test_scalar_v1_types_and_nulls() {
+    let cases: Vec<(DataType, Arc<dyn Array>, &str)> = vec![
+        (
+            DataType::Boolean,
+            Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)])),
+            "boolean_not",
+        ),
+        (
+            DataType::Int64,
+            Arc::new(Int64Array::from(vec![Some(1), None, Some(-2)])),
+            "add_one_int64",
+        ),
+        (
+            DataType::UInt64,
+            Arc::new(UInt64Array::from(vec![Some(1), None, Some(2)])),
+            "add_one_uint64",
+        ),
+        (
+            DataType::Float64,
+            Arc::new(Float64Array::from(vec![Some(1.5), None, Some(-2.25)])),
+            "double_float64",
+        ),
+        (
+            DataType::Utf8,
+            Arc::new(StringArray::from(vec![Some("abc"), Some("时序"), None])),
+            "append_wasm",
+        ),
+    ];
+
+    for (data_type, values, function_name) in cases {
+        let input = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                data_type.clone(),
+                true,
+            )])),
+            vec![values],
+        )
+        .unwrap();
+        let function = RUNTIME
+            .find_function(function_name, vec![data_type.clone()], data_type)
+            .unwrap();
+        let output = RUNTIME.call(&function, &input).unwrap();
+        assert_eq!(output.num_rows(), input.num_rows());
+        assert_eq!(output.column(0).null_count(), input.column(0).null_count());
+        match function_name {
+            "boolean_not" => {
+                let values = output
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .unwrap();
+                assert!(!values.value(0));
+                assert!(values.is_null(1));
+                assert!(values.value(2));
+            }
+            "add_one_int64" => {
+                let values = output
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                assert_eq!(values.value(0), 2);
+                assert!(values.is_null(1));
+                assert_eq!(values.value(2), -1);
+            }
+            "add_one_uint64" => {
+                let values = output
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap();
+                assert_eq!(values.value(0), 2);
+                assert!(values.is_null(1));
+                assert_eq!(values.value(2), 3);
+            }
+            "double_float64" => {
+                let values = output
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap();
+                assert_eq!(values.value(0), 3.0);
+                assert!(values.is_null(1));
+                assert_eq!(values.value(2), -4.5);
+            }
+            "append_wasm" => {
+                let values = output
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                assert_eq!(values.value(0), "abc-wasm");
+                assert_eq!(values.value(1), "时序-wasm");
+                assert!(values.is_null(2));
+            }
+            _ => unreachable!("unexpected test function"),
+        }
+    }
+}
+
+#[test]
+fn test_default_sandbox_denies_filesystem_network_and_environment() {
+    let input = RecordBatch::try_new_with_options(
+        Arc::new(Schema::empty()),
+        vec![],
+        &RecordBatchOptions::default().with_row_count(Some(1)),
+    )
+    .unwrap();
+
+    let create_file = RUNTIME
+        .find_function("create_file", Vec::<DataType>::new(), DataType::Null)
+        .unwrap();
+    assert!(RUNTIME.call(&create_file, &input).is_err());
+
+    for name in ["environment_access", "network_access"] {
+        let function = RUNTIME
+            .find_function(name, Vec::<DataType>::new(), DataType::Int64)
+            .unwrap();
+        let output = RUNTIME.call(&function, &input).unwrap();
+        let values = output
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 0, "{name} unexpectedly succeeded");
+    }
+}
+
+#[test]
+fn test_real_guest_memory_limit_and_recovery() {
+    let binary = std::fs::read(BINARY_PATH).unwrap();
+    let runtime = Runtime::builder(&binary)
+        .memory_size_limit(8 * 1024 * 1024)
+        .build()
+        .unwrap();
+    let input = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "bytes",
+            DataType::Int64,
+            false,
+        )])),
+        vec![Arc::new(Int64Array::from(vec![32 * 1024 * 1024]))],
+    )
+    .unwrap();
+    let allocate = runtime
+        .find_function("allocate_bytes", vec![DataType::Int64], DataType::Int64)
+        .unwrap();
+    assert!(runtime.call(&allocate, &input).is_err());
+
+    let healthy = runtime
+        .find_function("add_one_int64", vec![DataType::Int64], DataType::Int64)
+        .unwrap();
+    let healthy_input = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )])),
+        vec![Arc::new(Int64Array::from(vec![1]))],
+    )
+    .unwrap();
+    assert!(runtime.call(&healthy, &healthy_input).is_ok());
+}
+
+#[test]
+fn test_concurrent_callers_have_independent_instances() {
+    let workers = (0_i64..8)
+        .map(|value| {
+            std::thread::spawn(move || {
+                let input = RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![Field::new(
+                        "value",
+                        DataType::Int64,
+                        false,
+                    )])),
+                    vec![Arc::new(Int64Array::from(vec![value]))],
+                )
+                .unwrap();
+                let function = RUNTIME
+                    .find_function("add_one_int64", vec![DataType::Int64], DataType::Int64)
+                    .unwrap();
+                let output = RUNTIME.call(&function, &input).unwrap();
+                let values = output
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                assert_eq!(values.value(0), value + 1);
+            })
+        })
+        .collect::<Vec<_>>();
+    for worker in workers {
+        worker.join().expect("concurrent caller must not panic");
+    }
+}
+
+#[test]
+fn test_existing_abi3_guest_when_provided() {
+    let Some(path) = std::env::var_os("ARROW_UDF_ABI3_GUEST") else {
+        return;
+    };
+    let runtime = Runtime::new(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(runtime.abi_version(), (3, 0));
+    let input = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            true,
+        )])),
+        vec![Arc::new(Int64Array::from(vec![Some(1), None, Some(3)]))],
+    )
+    .unwrap();
+    let function = runtime
+        .find_function("add_one", vec![DataType::Int64], DataType::Int64)
+        .unwrap();
+    let output = runtime.call(&function, &input).unwrap();
+    let values = output
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(values.value(0), 2);
+    assert!(values.is_null(1));
+    assert_eq!(values.value(2), 4);
 }
 
 #[test]

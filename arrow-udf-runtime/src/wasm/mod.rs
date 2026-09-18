@@ -14,7 +14,7 @@
 
 #![doc = include_str!("README.md")]
 
-use anyhow::{Context, anyhow, bail, ensure};
+use anyhow::{Context, Error, anyhow, bail, ensure};
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, IntervalUnit, TimeUnit};
 use itertools::Itertools;
@@ -22,7 +22,13 @@ use ram_file::{RamFile, RamFileRef};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
-use wasi_common::{WasiCtx, sync::WasiCtxBuilder};
+use wasi_common::{
+    Error as WasiError, ErrorExt, Poll, WasiClocks, WasiCtx, WasiSched,
+    random::Deterministic,
+    sched::Duration as WasiDuration,
+    sync::{clocks_ctx, random_ctx},
+    table::Table,
+};
 use wasmtime::*;
 
 use crate::into_field::IntoField;
@@ -48,14 +54,240 @@ pub struct Runtime {
     abi_version: (u8, u8),
 }
 
-/// Configurations.
-#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+/// Configurations for a WASM UDF runtime.
+///
+/// Store limits are enforced independently for every pooled instance. Fuel
+/// and epoch deadlines are reset to their configured values before every UDF
+/// invocation. Compiled-module count and aggregate limits across multiple
+/// stores belong to the embedding application's module cache and scheduler.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[non_exhaustive]
 pub struct Config {
-    /// Memory size limit in bytes.
+    /// Maximum bytes for each guest linear memory.
+    ///
+    /// `None` preserves the legacy unbounded-memory behavior. Production
+    /// embedders should always set an explicit value.
     pub memory_size_limit: Option<usize>,
-    /// File size limit in bytes.
+    /// Maximum number of elements in each guest table.
+    pub table_elements_limit: Option<usize>,
+    /// Maximum number of instances in each Wasmtime Store.
+    pub instance_limit: Option<usize>,
+    /// Maximum number of tables in each Wasmtime Store.
+    pub table_limit: Option<usize>,
+    /// Maximum number of linear memories in each Wasmtime Store.
+    pub memory_count_limit: Option<usize>,
+    /// Fuel made available at the start of every UDF invocation.
+    ///
+    /// `None` disables fuel instrumentation. A configured value must be
+    /// greater than zero.
+    pub fuel_per_call: Option<u64>,
+    /// Epoch ticks allowed from the current engine epoch for every invocation.
+    ///
+    /// The embedding application advances epochs through [`EpochController`].
+    /// `None` disables epoch instrumentation. A configured value must be
+    /// greater than zero.
+    pub epoch_deadline_ticks: Option<u64>,
+    /// WASI capabilities visible to guest modules.
+    pub wasi: WasiPolicy,
+    /// Maximum captured stdout/stderr size in bytes, per stream and instance.
     pub file_size_limit: Option<usize>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            memory_size_limit: None,
+            table_elements_limit: None,
+            instance_limit: None,
+            table_limit: None,
+            memory_count_limit: None,
+            fuel_per_call: None,
+            epoch_deadline_ticks: None,
+            wasi: WasiPolicy::default(),
+            file_size_limit: None,
+        }
+    }
+}
+
+/// Clock capabilities exposed through WASI Preview1.
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+pub enum WasiClockPolicy {
+    /// Return a WASI error for realtime and monotonic clock requests.
+    #[default]
+    Denied,
+    /// Expose host realtime and monotonic clocks.
+    Ambient,
+}
+
+/// Randomness exposed through WASI Preview1.
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+pub enum WasiRandomPolicy {
+    /// Return the same deterministic byte stream in every invocation.
+    #[default]
+    Deterministic,
+    /// Expose nondeterministic host randomness.
+    Ambient,
+}
+
+/// WASI Preview1 capability policy.
+///
+/// Filesystem directories, sockets, environment variables, process arguments,
+/// and stdin are never inherited. Clocks and randomness are the only ambient
+/// capabilities that can be enabled explicitly.
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+pub struct WasiPolicy {
+    /// Guest clock policy.
+    pub clocks: WasiClockPolicy,
+    /// Guest randomness policy.
+    pub random: WasiRandomPolicy,
+}
+
+struct DeniedWasiScheduler;
+
+#[async_trait::async_trait]
+impl WasiSched for DeniedWasiScheduler {
+    async fn poll_oneoff<'a>(&self, _poll: &mut Poll<'a>) -> std::result::Result<(), WasiError> {
+        Err(WasiError::badf().context("WASI polling is not supported"))
+    }
+
+    async fn sched_yield(&self) -> std::result::Result<(), WasiError> {
+        Ok(())
+    }
+
+    async fn sleep(&self, _duration: WasiDuration) -> std::result::Result<(), WasiError> {
+        Err(WasiError::badf().context("WASI sleeping is not supported"))
+    }
+}
+
+/// Typed execution-control failures returned through `anyhow::Error`.
+///
+/// Callers can classify these errors with `Error::downcast_ref` while the
+/// existing public `anyhow::Result` API remains source-compatible.
+#[derive(Debug, thiserror::Error, PartialEq, Eq, Clone, Copy)]
+pub enum RuntimeControlError {
+    /// The configured per-call fuel budget was exhausted.
+    #[error("WASM UDF exhausted its per-call fuel budget")]
+    FuelExhausted,
+    /// The configured per-call epoch deadline was reached.
+    #[error("WASM UDF exceeded its epoch deadline")]
+    EpochDeadlineExceeded,
+}
+
+/// A weak handle used by an embedding application to advance engine epochs.
+///
+/// arrow-udf does not start a hidden timer thread. An application that uses
+/// epoch deadlines should advance this controller from its own ticker. The
+/// weak handle does not keep the runtime or engine alive.
+#[derive(Clone)]
+pub struct EpochController {
+    engine: EngineWeak,
+}
+
+impl EpochController {
+    /// Increment the engine epoch, returning `false` if the runtime was dropped.
+    pub fn increment(&self) -> bool {
+        let Some(engine) = self.engine.upgrade() else {
+            return false;
+        };
+        #[cfg(target_has_atomic = "64")]
+        engine.increment_epoch();
+        #[cfg(not(target_has_atomic = "64"))]
+        let _ = engine;
+        cfg!(target_has_atomic = "64")
+    }
+}
+
+/// Builder for a [`Runtime`] and its Wasmtime engine.
+pub struct RuntimeBuilder<'a> {
+    binary: &'a [u8],
+    config: Config,
+}
+
+impl<'a> RuntimeBuilder<'a> {
+    /// Create a builder for a WASM binary.
+    pub fn new(binary: &'a [u8]) -> Self {
+        Self {
+            binary,
+            config: Config::default(),
+        }
+    }
+
+    /// Replace the complete runtime policy.
+    pub fn config(mut self, config: Config) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Set the maximum bytes for each guest linear memory.
+    pub fn memory_size_limit(mut self, limit: usize) -> Self {
+        self.config.memory_size_limit = Some(limit);
+        self
+    }
+
+    /// Set the maximum elements for each guest table.
+    pub fn table_elements_limit(mut self, limit: usize) -> Self {
+        self.config.table_elements_limit = Some(limit);
+        self
+    }
+
+    /// Set the maximum instances in each Store.
+    pub fn instance_limit(mut self, limit: usize) -> Self {
+        self.config.instance_limit = Some(limit);
+        self
+    }
+
+    /// Set the maximum tables in each Store.
+    pub fn table_limit(mut self, limit: usize) -> Self {
+        self.config.table_limit = Some(limit);
+        self
+    }
+
+    /// Set the maximum linear memories in each Store.
+    pub fn memory_count_limit(mut self, limit: usize) -> Self {
+        self.config.memory_count_limit = Some(limit);
+        self
+    }
+
+    /// Set the fuel budget reset before every invocation.
+    pub fn fuel_per_call(mut self, fuel: u64) -> Self {
+        self.config.fuel_per_call = Some(fuel);
+        self
+    }
+
+    /// Set the relative epoch deadline reset before every invocation.
+    pub fn epoch_deadline_ticks(mut self, ticks: u64) -> Self {
+        self.config.epoch_deadline_ticks = Some(ticks);
+        self
+    }
+
+    /// Set the WASI Preview1 capability policy.
+    pub fn wasi_policy(mut self, policy: WasiPolicy) -> Self {
+        self.config.wasi = policy;
+        self
+    }
+
+    /// Compile the module and create a shareable runtime.
+    pub fn build(self) -> Result<Runtime> {
+        ensure!(
+            self.config.fuel_per_call != Some(0),
+            "fuel_per_call must be greater than zero"
+        );
+        ensure!(
+            self.config.epoch_deadline_ticks != Some(0),
+            "epoch_deadline_ticks must be greater than zero"
+        );
+        #[cfg(not(target_has_atomic = "64"))]
+        ensure!(
+            self.config.epoch_deadline_ticks.is_none(),
+            "epoch interruption requires 64-bit atomics"
+        );
+
+        let mut engine_config = wasmtime::Config::new();
+        engine_config.consume_fuel(self.config.fuel_per_call.is_some());
+        engine_config.epoch_interruption(self.config.epoch_deadline_ticks.is_some());
+        let engine = Engine::new(&engine_config).context("failed to create Wasmtime engine")?;
+        Runtime::with_config_engine(self.binary, self.config, &engine)
+    }
 }
 
 /// Implement `Clone` for `Runtime` so that we can simply `clone` to create a new
@@ -86,15 +318,22 @@ impl Debug for Runtime {
 
 impl Runtime {
     /// Create a new UDF runtime from a WASM binary.
+    ///
+    /// This preserves the legacy unbounded resource defaults. Production
+    /// embedders should use [`Runtime::builder`] and configure explicit limits.
+    /// WASI clocks are denied and randomness is deterministic by default.
     pub fn new(binary: &[u8]) -> Result<Self> {
         Self::with_config(binary, Config::default())
     }
 
+    /// Create a policy builder for a WASM binary.
+    pub fn builder(binary: &[u8]) -> RuntimeBuilder<'_> {
+        RuntimeBuilder::new(binary)
+    }
+
     /// Create a new UDF runtime from a WASM binary with configuration.
     pub fn with_config(binary: &[u8], config: Config) -> Result<Self> {
-        // use a global engine by default
-        static ENGINE: std::sync::LazyLock<Engine> = std::sync::LazyLock::new(Engine::default);
-        Self::with_config_engine(binary, config, &ENGINE)
+        RuntimeBuilder::new(binary).config(config).build()
     }
 
     /// Create a new UDF runtime from a WASM binary with a customized engine.
@@ -148,6 +387,17 @@ impl Runtime {
         self.abi_version
     }
 
+    /// Return a weak epoch controller when epoch interruption is enabled.
+    ///
+    /// The embedding application owns the ticker cadence and may share this
+    /// controller across threads. Each Store keeps an independent relative
+    /// deadline that is reset before every invocation.
+    pub fn epoch_controller(&self) -> Option<EpochController> {
+        self.config.epoch_deadline_ticks.map(|_| EpochController {
+            engine: self.module.engine().weak(),
+        })
+    }
+
     /// Find a function by name, argument types and return type.
     /// The returned [`FunctionHandle`] can be used to call the function.
     pub fn find_function(
@@ -167,6 +417,7 @@ impl Runtime {
         if let Some(export_name) = self.get_function_export_name_by_inlined_signature(&sig) {
             return Ok(FunctionHandle {
                 export_name: export_name.to_owned(),
+                return_field: ret,
             });
         }
         bail!(
@@ -267,8 +518,15 @@ impl Runtime {
             Instance::new(self)?
         };
 
+        instance.reset_call_limits()?;
+
         // call the function
-        let output = instance.call_scalar_function(export_name, input);
+        let output = instance
+            .call_scalar_function(export_name, input)
+            .and_then(|output| {
+                validate_scalar_output(&output, input.num_rows(), &func.return_field)?;
+                Ok(output)
+            });
 
         // put the instance back to the pool
         if output.is_ok() {
@@ -299,6 +557,8 @@ impl Runtime {
             Instance::new(self)?
         };
 
+        instance.reset_call_limits()?;
+
         Ok(generator!({
             // call the function
             let iter = match instance.call_table_function(export_name, input) {
@@ -321,6 +581,7 @@ impl Runtime {
 
 pub struct FunctionHandle {
     export_name: String,
+    return_field: Field,
 }
 
 pub struct TableFunctionHandle {
@@ -342,6 +603,9 @@ struct Instance {
     store: Store<(WasiCtx, StoreLimits)>,
     stdout: RamFileRef,
     stderr: RamFileRef,
+    fuel_per_call: Option<u64>,
+    epoch_deadline_ticks: Option<u64>,
+    wasi_random_policy: WasiRandomPolicy,
 }
 
 impl Instance {
@@ -352,27 +616,62 @@ impl Instance {
         let mut linker = Linker::new(engine);
         wasi_common::sync::add_to_linker(&mut linker, |(wasi, _)| wasi)?;
 
-        // Create a WASI context and put it in a Store; all instances in the store
-        // share this context. `WasiCtxBuilder` provides a number of ways to
-        // configure what the target program will have access to.
+        // Create a capability-minimized WASI context and put it in a Store.
+        // No directories, sockets, environment, arguments, or stdin are inherited.
         let file_size_limit = rt.config.file_size_limit.unwrap_or(1024);
         let stdout = RamFileRef::new(RamFile::with_size_limit(file_size_limit));
         let stderr = RamFileRef::new(RamFile::with_size_limit(file_size_limit));
-        let wasi = WasiCtxBuilder::new()
-            .stdout(Box::new(stdout.clone()))
-            .stderr(Box::new(stderr.clone()))
-            .build();
+        let random: Box<dyn wasi_common::RngCore + Send + Sync> = match rt.config.wasi.random {
+            WasiRandomPolicy::Deterministic => deterministic_random(),
+            WasiRandomPolicy::Ambient => random_ctx(),
+        };
+        let clocks = match rt.config.wasi.clocks {
+            WasiClockPolicy::Denied => WasiClocks::new(),
+            WasiClockPolicy::Ambient => clocks_ctx(),
+        };
+        let wasi = WasiCtx::new(random, clocks, Box::new(DeniedWasiScheduler), Table::new());
+        wasi.set_stdout(Box::new(stdout.clone()));
+        wasi.set_stderr(Box::new(stderr.clone()));
         let limits = {
             let mut builder = StoreLimitsBuilder::new();
             if let Some(limit) = rt.config.memory_size_limit {
                 builder = builder.memory_size(limit);
+            }
+            if let Some(limit) = rt.config.table_elements_limit {
+                builder = builder.table_elements(limit);
+            }
+            if let Some(limit) = rt.config.instance_limit {
+                builder = builder.instances(limit);
+            }
+            if let Some(limit) = rt.config.table_limit {
+                builder = builder.tables(limit);
+            }
+            if let Some(limit) = rt.config.memory_count_limit {
+                builder = builder.memories(limit);
+            }
+            if rt.config.memory_size_limit.is_some() || rt.config.table_elements_limit.is_some() {
+                builder = builder.trap_on_grow_failure(true);
             }
             builder.build()
         };
         let mut store = Store::new(engine, (wasi, limits));
         store.limiter(|(_, limiter)| limiter);
 
-        let instance = linker.instantiate(&mut store, module)?;
+        if let Some(fuel) = rt.config.fuel_per_call {
+            store
+                .set_fuel(fuel)
+                .context("failed to initialize Wasmtime fuel")?;
+        }
+        #[cfg(target_has_atomic = "64")]
+        if let Some(ticks) = rt.config.epoch_deadline_ticks {
+            store.set_epoch_deadline(ticks);
+            store.epoch_deadline_trap();
+        }
+
+        let instance = linker
+            .instantiate(&mut store, module)
+            .map_err(classify_execution_error)
+            .context("failed to instantiate WASM UDF module")?;
         let mut functions = HashMap::new();
         for export in module.exports() {
             let Some(encoded) = export.name().strip_prefix("arrowudf_") else {
@@ -402,7 +701,35 @@ impl Instance {
             functions,
             stdout,
             stderr,
+            fuel_per_call: rt.config.fuel_per_call,
+            epoch_deadline_ticks: rt.config.epoch_deadline_ticks,
+            wasi_random_policy: rt.config.wasi.random,
         })
+    }
+
+    /// Reset invocation-scoped execution controls before entering guest code.
+    fn reset_call_limits(&mut self) -> Result<()> {
+        if self.wasi_random_policy == WasiRandomPolicy::Deterministic {
+            let mut random = self
+                .store
+                .data_mut()
+                .0
+                .random
+                .lock()
+                .map_err(|_| anyhow!("deterministic WASI random state lock was poisoned"))?;
+            *random = deterministic_random();
+        }
+        if let Some(fuel) = self.fuel_per_call {
+            self.store
+                .set_fuel(fuel)
+                .context("failed to reset Wasmtime fuel for UDF invocation")?;
+        }
+        #[cfg(target_has_atomic = "64")]
+        if let Some(ticks) = self.epoch_deadline_ticks {
+            self.store.set_epoch_deadline(ticks);
+            self.store.epoch_deadline_trap();
+        }
+        Ok(())
     }
 
     /// Call a scalar function.
@@ -424,27 +751,39 @@ impl Instance {
 
         // allocate memory for input buffer and output struct
         let alloc_len = u32::try_from(input.len() + 4 * 2).context("input too large")?;
-        let alloc_ptr = self.alloc.call(&mut self.store, (alloc_len, 4))?;
+        let alloc_ptr = self
+            .alloc
+            .call(&mut self.store, (alloc_len, 4))
+            .map_err(classify_execution_error)?;
         ensure!(alloc_ptr != 0, "failed to allocate for input");
-        let in_ptr = alloc_ptr + 4 * 2;
+        let in_ptr = alloc_ptr
+            .checked_add(4 * 2)
+            .context("guest input pointer overflow")?;
 
         // write input to memory
         self.memory
             .write(&mut self.store, in_ptr as usize, &input)?;
 
         // call the function
-        let result = func.call(&mut self.store, (in_ptr, input.len() as u32, alloc_ptr));
+        let result = func
+            .call(&mut self.store, (in_ptr, input.len() as u32, alloc_ptr))
+            .map_err(classify_execution_error);
         let errno = self.append_stdio(result)?;
 
         // get return values
         let out_ptr = self.read_u32(alloc_ptr)?;
-        let out_len = self.read_u32(alloc_ptr + 4)?;
+        let out_len = self.read_u32(
+            alloc_ptr
+                .checked_add(4)
+                .context("guest output-length pointer overflow")?,
+        )?;
 
         // read output from memory
+        let out_range = checked_u32_range(out_ptr, out_len)?;
         let out_bytes = self
             .memory
             .data(&self.store)
-            .get(out_ptr as usize..(out_ptr + out_len) as usize)
+            .get(out_range)
             .context("output slice out of bounds")?;
         let result = match errno {
             0 => Ok(decode_record_batch(out_bytes)?),
@@ -453,8 +792,11 @@ impl Instance {
 
         // deallocate memory
         self.dealloc
-            .call(&mut self.store, (alloc_ptr, alloc_len, 4))?;
-        self.dealloc.call(&mut self.store, (out_ptr, out_len, 1))?;
+            .call(&mut self.store, (alloc_ptr, alloc_len, 4))
+            .map_err(classify_execution_error)?;
+        self.dealloc
+            .call(&mut self.store, (out_ptr, out_len, 1))
+            .map_err(classify_execution_error)?;
 
         result
     }
@@ -482,27 +824,39 @@ impl Instance {
 
         // allocate memory for input buffer and output struct
         let alloc_len = u32::try_from(input.len() + 4 * 2).context("input too large")?;
-        let alloc_ptr = self.alloc.call(&mut self.store, (alloc_len, 4))?;
+        let alloc_ptr = self
+            .alloc
+            .call(&mut self.store, (alloc_len, 4))
+            .map_err(classify_execution_error)?;
         ensure!(alloc_ptr != 0, "failed to allocate for input");
-        let in_ptr = alloc_ptr + 4 * 2;
+        let in_ptr = alloc_ptr
+            .checked_add(4 * 2)
+            .context("guest input pointer overflow")?;
 
         // write input to memory
         self.memory
             .write(&mut self.store, in_ptr as usize, &input)?;
 
         // call the function
-        let result = func.call(&mut self.store, (in_ptr, input.len() as u32, alloc_ptr));
+        let result = func
+            .call(&mut self.store, (in_ptr, input.len() as u32, alloc_ptr))
+            .map_err(classify_execution_error);
         let errno = self.append_stdio(result)?;
 
         // get return values
         let out_ptr = self.read_u32(alloc_ptr)?;
-        let out_len = self.read_u32(alloc_ptr + 4)?;
+        let out_len = self.read_u32(
+            alloc_ptr
+                .checked_add(4)
+                .context("guest output-length pointer overflow")?,
+        )?;
 
         // read output from memory
+        let out_range = checked_u32_range(out_ptr, out_len)?;
         let out_bytes = self
             .memory
             .data(&self.store)
-            .get(out_ptr as usize..(out_ptr + out_len) as usize)
+            .get(out_range)
             .context("output slice out of bounds")?;
 
         let ptr = match errno {
@@ -511,8 +865,11 @@ impl Instance {
                 let err = anyhow!("{}", std::str::from_utf8(out_bytes)?);
                 // deallocate memory
                 self.dealloc
-                    .call(&mut self.store, (alloc_ptr, alloc_len, 4))?;
-                self.dealloc.call(&mut self.store, (out_ptr, out_len, 1))?;
+                    .call(&mut self.store, (alloc_ptr, alloc_len, 4))
+                    .map_err(classify_execution_error)?;
+                self.dealloc
+                    .call(&mut self.store, (out_ptr, out_len, 1))
+                    .map_err(classify_execution_error)?;
 
                 return Err(err);
             }
@@ -530,10 +887,15 @@ impl Instance {
             fn next(&mut self) -> Result<Option<RecordBatch>> {
                 self.instance
                     .record_batch_iterator_next
-                    .call(&mut self.instance.store, (self.ptr, self.alloc_ptr))?;
+                    .call(&mut self.instance.store, (self.ptr, self.alloc_ptr))
+                    .map_err(classify_execution_error)?;
                 // get return values
                 let out_ptr = self.instance.read_u32(self.alloc_ptr)?;
-                let out_len = self.instance.read_u32(self.alloc_ptr + 4)?;
+                let out_len = self.instance.read_u32(
+                    self.alloc_ptr
+                        .checked_add(4)
+                        .context("guest output-length pointer overflow")?,
+                )?;
 
                 if out_ptr == 0 {
                     // end of iteration
@@ -541,18 +903,20 @@ impl Instance {
                 }
 
                 // read output from memory
+                let out_range = checked_u32_range(out_ptr, out_len)?;
                 let out_bytes = self
                     .instance
                     .memory
                     .data(&self.instance.store)
-                    .get(out_ptr as usize..(out_ptr + out_len) as usize)
+                    .get(out_range)
                     .context("output slice out of bounds")?;
                 let batch = decode_record_batch(out_bytes)?;
 
                 // dealloc output
                 self.instance
                     .dealloc
-                    .call(&mut self.instance.store, (out_ptr, out_len, 1))?;
+                    .call(&mut self.instance.store, (out_ptr, out_len, 1))
+                    .map_err(classify_execution_error)?;
 
                 Ok(Some(batch))
             }
@@ -590,10 +954,15 @@ impl Instance {
 
     /// Read a `u32` from memory.
     fn read_u32(&mut self, ptr: u32) -> Result<u32> {
+        let bytes = self
+            .memory
+            .data(&self.store)
+            .get(checked_u32_range(ptr, 4)?)
+            .context("guest u32 pointer out of bounds")?;
         Ok(u32::from_le_bytes(
-            self.memory.data(&self.store)[ptr as usize..(ptr + 4) as usize]
+            bytes
                 .try_into()
-                .unwrap(),
+                .context("guest u32 value had an invalid length")?,
         ))
     }
 
@@ -610,6 +979,25 @@ impl Instance {
             ))),
         }
     }
+}
+
+fn deterministic_random() -> Box<dyn wasi_common::RngCore + Send + Sync> {
+    Box::new(Deterministic::new(b"arrow-udf deterministic WASI".to_vec()))
+}
+
+fn classify_execution_error(error: Error) -> Error {
+    match error.downcast_ref::<Trap>() {
+        Some(Trap::OutOfFuel) => error.context(RuntimeControlError::FuelExhausted),
+        Some(Trap::Interrupt) => error.context(RuntimeControlError::EpochDeadlineExceeded),
+        _ => error,
+    }
+}
+
+fn checked_u32_range(ptr: u32, len: u32) -> Result<std::ops::Range<usize>> {
+    let end = ptr
+        .checked_add(len)
+        .context("guest pointer plus length overflowed")?;
+    Ok(ptr as usize..end as usize)
 }
 
 /// Decode a string from symbol name using customized base64.
@@ -639,8 +1027,34 @@ fn encode_record_batch(batch: &RecordBatch) -> Result<Vec<u8>> {
 
 fn decode_record_batch(bytes: &[u8]) -> Result<RecordBatch> {
     let mut reader = arrow_ipc::reader::FileReader::try_new(std::io::Cursor::new(bytes), None)?;
-    let batch = reader.next().unwrap()?;
+    let batch = reader
+        .next()
+        .context("guest returned Arrow IPC without a record batch")??;
     Ok(batch)
+}
+
+fn validate_scalar_output(
+    output: &RecordBatch,
+    expected_rows: usize,
+    expected: &Field,
+) -> Result<()> {
+    let field = output
+        .schema_ref()
+        .fields()
+        .first()
+        .context("guest scalar output has no value column")?;
+    ensure!(
+        field.data_type() == expected.data_type(),
+        "guest scalar output type mismatch: expected {}, got {}",
+        expected.data_type(),
+        field.data_type()
+    );
+    ensure!(
+        output.num_rows() == expected_rows,
+        "guest scalar output row-count mismatch: expected {expected_rows}, got {}",
+        output.num_rows()
+    );
+    Ok(())
 }
 
 /// Construct the function signature generated by `function` macro.

@@ -75,6 +75,7 @@ arrow-select = { workspace = true }
 expect-test = "1"
 tokio-test = "0.4"
 mockito = "1.6.1"
+wat = "1"
 
 [[test]]
 name = "remote"

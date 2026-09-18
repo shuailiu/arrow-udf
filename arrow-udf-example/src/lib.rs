@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use arrow_udf::{function, types::*};
+use std::fmt::Write;
 
 #[function("gcd(int, int) -> int")]
 fn gcd(mut a: i32, mut b: i32) -> i32 {
@@ -49,6 +50,48 @@ fn create_file() {
 fn sleep(second: i32) -> i32 {
     std::thread::sleep(std::time::Duration::from_secs(second as u64));
     0
+}
+
+#[function("boolean_not(boolean) -> boolean")]
+fn boolean_not(value: bool) -> bool {
+    !value
+}
+
+#[function("add_one_int64(int64) -> int64")]
+fn add_one_int64(value: i64) -> i64 {
+    value + 1
+}
+
+#[function("add_one_uint64(uint64) -> uint64")]
+fn add_one_uint64(value: u64) -> u64 {
+    value + 1
+}
+
+#[function("double_float64(float64) -> float64")]
+fn double_float64(value: f64) -> f64 {
+    value * 2.0
+}
+
+#[function("append_wasm(string) -> string")]
+fn append_wasm(value: &str, output: &mut impl Write) {
+    write!(output, "{value}-wasm").unwrap();
+}
+
+#[function("allocate_bytes(int64) -> int64")]
+fn allocate_bytes(bytes: i64) -> i64 {
+    let allocation = vec![7_u8; bytes as usize];
+    std::hint::black_box(&allocation);
+    allocation.len() as i64
+}
+
+#[function("environment_access() -> int64")]
+fn environment_access() -> i64 {
+    std::env::vars().next().is_some() as i64
+}
+
+#[function("network_access() -> int64")]
+fn network_access() -> i64 {
+    std::net::TcpStream::connect("127.0.0.1:9").is_ok() as i64
 }
 
 #[function("decimal_add(decimal, decimal) -> decimal")]

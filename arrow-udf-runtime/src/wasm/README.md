@@ -66,6 +66,48 @@ let output = runtime.call(func, &input).unwrap();
 The WebAssembly runtime is powered by [Wasmtime](https://wasmtime.dev/).
 Notice that each WebAssembly instance can only run single-threaded, we maintain an instance pool internally to support parallel calls from multiple threads.
 
+## Runtime controls
+
+Use `Runtime::builder` for untrusted modules and set explicit limits for the
+embedding application:
+
+```rust,ignore
+let runtime = Runtime::builder(&binary)
+    .memory_size_limit(64 * 1024 * 1024)
+    .table_elements_limit(10_000)
+    .instance_limit(1)
+    .table_limit(4)
+    .memory_count_limit(4)
+    .fuel_per_call(10_000_000)
+    .epoch_deadline_ticks(2)
+    .build()?;
+
+let epoch = runtime.epoch_controller().unwrap();
+// The embedding application advances `epoch` from its own timer or scheduler.
+epoch.increment();
+```
+
+Memory and table-element limits apply to each memory or table in a Store.
+Instance, table, and linear-memory counts also apply per Store. Fuel and the
+relative epoch deadline are reset before every UDF invocation, including when
+an instance is reused from the pool. Fuel exhaustion and epoch interruption
+can be classified by downcasting the returned `anyhow::Error` to
+`RuntimeControlError`.
+
+The runtime never starts a timer thread. Epoch cadence and aggregate limits
+across stores are responsibilities of the embedding application. Wasmtime 36
+does not expose a per-Store compiled-module count limit, so a bounded module
+cache must enforce that limit outside this runtime.
+
+The default WASI Preview1 policy inherits no filesystem directories, sockets,
+environment variables, process arguments, or stdin. It denies clock access and
+uses the same deterministic random byte stream for every call. Polling and
+sleeping are also denied, so synchronous host calls cannot bypass fuel and
+epoch execution guards. Ambient clocks and randomness require an explicit
+`WasiPolicy` opt-in. `Runtime::new` remains convenient and backward-compatible
+for resource sizing, but production embedders should use the builder and set
+finite resource and execution limits.
+
 See the [example](./examples/wasm.rs) for more details. To run the example:
 
 ```sh

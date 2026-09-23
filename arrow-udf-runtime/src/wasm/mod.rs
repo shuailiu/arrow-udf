@@ -15,8 +15,9 @@
 #![doc = include_str!("README.md")]
 
 use anyhow::{Context, Error, anyhow, bail, ensure};
-use arrow_array::RecordBatch;
-use arrow_schema::{DataType, Field, IntervalUnit, TimeUnit};
+use arrow_array::{Array, ArrayRef, BinaryArray, ListArray, RecordBatch, RecordBatchOptions};
+use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+use arrow_schema::{DataType, Field, IntervalUnit, Schema, TimeUnit};
 use itertools::Itertools;
 use ram_file::{RamFile, RamFileRef};
 use std::collections::{HashMap, HashSet};
@@ -463,6 +464,168 @@ impl Runtime {
         )
     }
 
+    /// Find the four functions that implement the opaque-state aggregate ABI.
+    ///
+    /// The ABI keeps aggregate state in host-owned Arrow binary values and
+    /// uses list arguments to preserve one guest invocation per input batch:
+    ///
+    /// ```text
+    /// <name>_init() -> binary
+    /// <name>_update(binary, arg0[], ...) -> binary
+    /// <name>_merge(binary, binary[]) -> binary
+    /// <name>_finish(binary) -> result
+    /// ```
+    pub fn find_aggregate_function(
+        &self,
+        name: &str,
+        arg_types: Vec<impl IntoField>,
+        return_type: impl IntoField,
+    ) -> Result<AggregateFunctionHandle> {
+        let arguments = arg_types
+            .into_iter()
+            .enumerate()
+            .map(|(index, argument)| argument.into_field(&format!("arg{index}")))
+            .collect::<Vec<_>>();
+        let return_field = return_type.into_field("result");
+        let state_field = Field::new("state", DataType::Binary, false);
+        let list_arguments = arguments
+            .iter()
+            .map(|argument| {
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    argument.data_type().clone(),
+                    true,
+                )))
+            })
+            .collect::<Vec<_>>();
+
+        Ok(AggregateFunctionHandle {
+            init: self.find_function(
+                &format!("{name}_init"),
+                Vec::<Field>::new(),
+                state_field.clone(),
+            )?,
+            update: self.find_function(
+                &format!("{name}_update"),
+                std::iter::once(DataType::Binary)
+                    .chain(list_arguments)
+                    .collect::<Vec<_>>(),
+                state_field.clone(),
+            )?,
+            merge: self.find_function(
+                &format!("{name}_merge"),
+                vec![
+                    DataType::Binary,
+                    DataType::List(Arc::new(Field::new("item", DataType::Binary, true))),
+                ],
+                state_field.clone(),
+            )?,
+            finish: self.find_function(
+                &format!("{name}_finish"),
+                vec![DataType::Binary],
+                return_field,
+            )?,
+            arguments,
+        })
+    }
+
+    /// Create one host-owned aggregate state.
+    pub fn create_aggregate_state(&self, function: &AggregateFunctionHandle) -> Result<Vec<u8>> {
+        let input = RecordBatch::try_new_with_options(
+            Arc::new(Schema::empty()),
+            Vec::new(),
+            &RecordBatchOptions::default().with_row_count(Some(1)),
+        )?;
+        aggregate_state_from_output(self.call(&function.init, &input)?)
+    }
+
+    /// Update one aggregate state with a complete Arrow input batch.
+    pub fn update_aggregate_state(
+        &self,
+        function: &AggregateFunctionHandle,
+        state: &[u8],
+        input: &RecordBatch,
+    ) -> Result<Vec<u8>> {
+        ensure!(
+            input.num_columns() == function.arguments.len(),
+            "aggregate input column-count mismatch: expected {}, got {}",
+            function.arguments.len(),
+            input.num_columns()
+        );
+
+        let mut fields = Vec::with_capacity(input.num_columns() + 1);
+        let mut columns = Vec::with_capacity(input.num_columns() + 1);
+        fields.push(Field::new("state", DataType::Binary, false));
+        columns.push(Arc::new(BinaryArray::from(vec![Some(state)])) as ArrayRef);
+        for (index, (argument, column)) in
+            function.arguments.iter().zip(input.columns()).enumerate()
+        {
+            ensure!(
+                argument.data_type() == column.data_type(),
+                "aggregate input type mismatch at column {index}: expected {}, got {}",
+                argument.data_type(),
+                column.data_type()
+            );
+            let list = singleton_list(column.clone())?;
+            fields.push(Field::new(
+                format!("arg{index}"),
+                list.data_type().clone(),
+                false,
+            ));
+            columns.push(Arc::new(list));
+        }
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
+        aggregate_state_from_output(self.call(&function.update, &batch)?)
+    }
+
+    /// Merge a batch of partial states into one aggregate state.
+    pub fn merge_aggregate_states(
+        &self,
+        function: &AggregateFunctionHandle,
+        state: &[u8],
+        partial_states: ArrayRef,
+    ) -> Result<Vec<u8>> {
+        ensure!(
+            partial_states.data_type() == &DataType::Binary,
+            "aggregate partial-state type mismatch: expected Binary, got {}",
+            partial_states.data_type()
+        );
+        let states = singleton_list(partial_states)?;
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("state", DataType::Binary, false),
+                Field::new("partial_states", states.data_type().clone(), false),
+            ])),
+            vec![
+                Arc::new(BinaryArray::from(vec![Some(state)])),
+                Arc::new(states),
+            ],
+        )?;
+        aggregate_state_from_output(self.call(&function.merge, &batch)?)
+    }
+
+    /// Finalize one or more aggregate states in a single guest invocation.
+    pub fn finish_aggregate_states(
+        &self,
+        function: &AggregateFunctionHandle,
+        states: ArrayRef,
+    ) -> Result<RecordBatch> {
+        ensure!(
+            states.data_type() == &DataType::Binary,
+            "aggregate state type mismatch: expected Binary, got {}",
+            states.data_type()
+        );
+        let input = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "state",
+                DataType::Binary,
+                false,
+            )])),
+            vec![states],
+        )?;
+        self.call(&function.finish, &input)
+    }
+
     /// Given a function signature that inlines struct types, find the export function name.
     ///
     /// # Example
@@ -584,8 +747,44 @@ pub struct FunctionHandle {
     return_field: Field,
 }
 
+/// Validated handles for opaque host-state aggregate execution.
+pub struct AggregateFunctionHandle {
+    init: FunctionHandle,
+    update: FunctionHandle,
+    merge: FunctionHandle,
+    finish: FunctionHandle,
+    arguments: Vec<Field>,
+}
+
 pub struct TableFunctionHandle {
     export_name: String,
+}
+
+fn singleton_list(values: ArrayRef) -> Result<ListArray> {
+    let length = i32::try_from(values.len()).context("aggregate input batch is too large")?;
+    Ok(ListArray::new(
+        Arc::new(Field::new("item", values.data_type().clone(), true)),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, length])),
+        values,
+        None,
+    ))
+}
+
+fn aggregate_state_from_output(output: RecordBatch) -> Result<Vec<u8>> {
+    ensure!(
+        output.num_columns() == 1 && output.num_rows() == 1,
+        "aggregate state operation must return exactly one binary value"
+    );
+    let states = output
+        .column(0)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .context("aggregate state operation returned a non-binary value")?;
+    ensure!(
+        !states.is_null(0),
+        "aggregate state operation returned NULL"
+    );
+    Ok(states.value(0).to_vec())
 }
 
 struct Instance {

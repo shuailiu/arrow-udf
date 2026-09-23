@@ -17,8 +17,8 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, RecordBatchOptions,
-    StringArray, UInt64Array,
+    Array, BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch,
+    RecordBatchOptions, StringArray, UInt64Array,
 };
 use arrow_cast::pretty::pretty_format_batches;
 use arrow_schema::{DataType, Field, Fields, Schema};
@@ -102,6 +102,74 @@ fn test_gcd() {
         |     |
         +-----+"#]],
     );
+}
+
+#[test]
+fn opaque_aggregate_state_updates_merges_and_finishes_by_batch() {
+    let aggregate = RUNTIME
+        .find_aggregate_function("sum", vec![DataType::Float64], DataType::Float64)
+        .unwrap();
+    let initial = RUNTIME.create_aggregate_state(&aggregate).unwrap();
+
+    let left = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float64,
+            true,
+        )])),
+        vec![Arc::new(Float64Array::from(vec![
+            Some(1.0),
+            None,
+            Some(2.5),
+        ]))],
+    )
+    .unwrap();
+    let right = RecordBatch::try_new(
+        left.schema(),
+        vec![Arc::new(Float64Array::from(vec![Some(-1.0), Some(4.0)]))],
+    )
+    .unwrap();
+    let left = RUNTIME
+        .update_aggregate_state(&aggregate, &initial, &left)
+        .unwrap();
+    let right = RUNTIME
+        .update_aggregate_state(&aggregate, &initial, &right)
+        .unwrap();
+
+    let partials = Arc::new(BinaryArray::from(vec![
+        Some(left.as_slice()),
+        Some(right.as_slice()),
+    ]));
+    let merged = RUNTIME
+        .merge_aggregate_states(&aggregate, &initial, partials.clone())
+        .unwrap();
+    let reversed = Arc::new(BinaryArray::from(vec![
+        Some(right.as_slice()),
+        Some(left.as_slice()),
+    ]));
+    let reverse_merged = RUNTIME
+        .merge_aggregate_states(&aggregate, &initial, reversed)
+        .unwrap();
+    assert_eq!(merged, reverse_merged);
+
+    let empty = Arc::new(BinaryArray::from(Vec::<Option<&[u8]>>::new()));
+    let empty_merged = RUNTIME
+        .merge_aggregate_states(&aggregate, &initial, empty)
+        .unwrap();
+    assert_eq!(empty_merged, initial);
+
+    let states = Arc::new(BinaryArray::from(vec![
+        Some(merged.as_slice()),
+        Some(initial.as_slice()),
+    ]));
+    let output = RUNTIME.finish_aggregate_states(&aggregate, states).unwrap();
+    let values = output
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(values.value(0), 6.5);
+    assert!(values.is_null(1));
 }
 
 #[test]

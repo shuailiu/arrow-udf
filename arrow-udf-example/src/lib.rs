@@ -64,6 +64,16 @@ fn add_one_int64(value: i64) -> i64 {
     value + 1
 }
 
+#[function("bench_add2_int64(int64, int64) -> int64")]
+fn bench_add2_int64(a: i64, b: i64) -> i64 {
+    a + b
+}
+
+#[function("bench_add4_int64(int64, int64, int64, int64) -> int64")]
+fn bench_add4_int64(a: i64, b: i64, c: i64, d: i64) -> i64 {
+    a + b + c + d
+}
+
 #[function("add_one_uint64(uint64) -> uint64")]
 fn add_one_uint64(value: u64) -> u64 {
     value + 1
@@ -204,4 +214,41 @@ fn sum_merge_batch(states: &BinaryArray, partial_states: &ListArray) -> BinaryAr
 fn sum_finish(state: &[u8]) -> Option<f64> {
     let (sum, seen) = decode_sum_state(state);
     seen.then_some(sum)
+}
+
+// Benchmark-only opaque-state pass-through aggregate. The host benchmark
+// supplies states of different sizes to measure ABI transfer cost without
+// changing the production aggregate ABI.
+#[function("bench_state_init() -> binary")]
+fn bench_state_init() -> Vec<u8> {
+    vec![0; 16]
+}
+
+#[function(
+    "bench_state_update(binary, float64[]) -> binary",
+    batch_fn = "bench_state_update_batch"
+)]
+fn bench_state_update(_state: &[u8], _values: &[f64]) -> Vec<u8> {
+    unreachable!("benchmark aggregate update uses its vectorized batch function")
+}
+
+fn bench_state_update_batch(states: &BinaryArray, _values: &ListArray) -> BinaryArray {
+    BinaryArray::from(vec![Some(states.value(0))])
+}
+
+#[function(
+    "bench_state_merge(binary, binary[]) -> binary",
+    batch_fn = "bench_state_merge_batch"
+)]
+fn bench_state_merge(_state: &[u8], _partial_states: &BinaryArray) -> Vec<u8> {
+    unreachable!("benchmark aggregate merge uses its vectorized batch function")
+}
+
+fn bench_state_merge_batch(states: &BinaryArray, _partial_states: &ListArray) -> BinaryArray {
+    BinaryArray::from(vec![Some(states.value(0))])
+}
+
+#[function("bench_state_finish(binary) -> int64")]
+fn bench_state_finish(state: &[u8]) -> i64 {
+    state.len() as i64
 }

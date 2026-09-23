@@ -8,6 +8,10 @@ license = "Apache-2.0"
 publish = false
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = []
+all-runtimes = ["arrow-udf-runtime/embedded"]
+
 [dev-dependencies]
 arrow-arith.workspace = true
 arrow-array.workspace = true
@@ -15,7 +19,7 @@ arrow-cast = { workspace = true, features = ["prettyprint"] }
 arrow-schema.workspace = true
 arrow-udf = { path = "../arrow-udf" }
 arrow-udf-runtime = { path = "../arrow-udf-runtime", default-features = false, features = [
-    "embedded",
+    "wasm-runtime",
 ] }
 criterion = { version = "0.5", features = ["async_tokio", "async_futures"] }
 tokio = { workspace = true, features = ["rt"] }
@@ -23,4 +27,9 @@ futures-util = "0.3"
 
 [[bench]]
 name = "bench"
+harness = false
+required-features = ["all-runtimes"]
+
+[[bench]]
+name = "wasm_performance"
 harness = false

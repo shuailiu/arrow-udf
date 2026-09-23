@@ -19,8 +19,18 @@ use std::{sync::Arc, thread, time::Duration};
 use arrow_array::{Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use arrow_udf_runtime::wasm::{
-    Runtime, RuntimeControlError, WasiClockPolicy, WasiPolicy, WasiRandomPolicy,
+    Runtime, RuntimeBuilder, RuntimeControlError, WasiClockPolicy, WasiPolicy, WasiRandomPolicy,
 };
+
+fn isolated_builder(binary: &[u8], pool_size: usize) -> RuntimeBuilder<'_> {
+    Runtime::builder(binary)
+        .memory_size_limit(64 * 1024 * 1024)
+        .table_elements_limit(100_000)
+        .instance_limit(1)
+        .table_limit(1)
+        .memory_count_limit(1)
+        .isolated_instance_pool_size(pool_size)
+}
 
 fn module(extra_imports: &str, extra_items: &str) -> Vec<u8> {
     wat::parse_str(format!(
@@ -221,6 +231,93 @@ fn random_module() -> Vec<u8> {
     )
 }
 
+fn isolation_module() -> Vec<u8> {
+    module(
+        "",
+        r#"
+        (data (i32.const 128) "\07\00\00\00")
+        (global $state (mut i32) (i32.const 0))
+        (table $state_table 1 funcref)
+        (func $marker)
+        (elem declare func $marker)
+        (func $mutate
+          i32.const 128
+          i32.const 99
+          i32.store
+          i32.const 1
+          global.set $state
+          i32.const 0
+          ref.func $marker
+          table.set $state_table
+          i32.const 1
+          memory.grow
+          drop)
+        (func $assert_pristine
+          i32.const 128
+          i32.load
+          i32.const 7
+          i32.eq
+          if
+          else
+            unreachable
+          end
+          global.get $state
+          i32.eqz
+          if
+          else
+            unreachable
+          end
+          i32.const 0
+          table.get $state_table
+          ref.is_null
+          if
+          else
+            unreachable
+          end
+          memory.size
+          i32.const 4
+          i32.eq
+          if
+          else
+            unreachable
+          end)
+        (func (export "arrowudf_bXV0YXRlX3N0YXRlKGludDY0KS0$aW50NjQ")
+              (param $input i32) (param $length i32) (param $output i32) (result i32)
+          call $mutate
+          local.get $input
+          local.get $length
+          local.get $output
+          call $return_input)
+        (func (export "arrowudf_YXNzZXJ0X3ByaXN0aW5lKGludDY0KS0$aW50NjQ")
+              (param $input i32) (param $length i32) (param $output i32) (result i32)
+          call $assert_pristine
+          local.get $input
+          local.get $length
+          local.get $output
+          call $return_input)
+        (func (export "arrowudf_bXV0YXRlX2FuZF90cmFwKGludDY0KS0$aW50NjQ")
+              (param i32 i32 i32) (result i32)
+          call $mutate
+          unreachable)
+        (func (export "arrowudf_bXV0YXRlX3dyb25nX3R5cGUoaW50NjQpLT5mbG9hdDY0")
+              (param $input i32) (param $length i32) (param $output i32) (result i32)
+          call $mutate
+          local.get $input
+          local.get $length
+          local.get $output
+          call $return_input)
+        (func (export "arrowudf_YXNzZXJ0X3RoZW5fbXV0YXRlKGludDY0KS0$aW50NjQ")
+              (param $input i32) (param $length i32) (param $output i32) (result i32)
+          call $assert_pristine
+          call $mutate
+          local.get $input
+          local.get $length
+          local.get $output
+          call $return_input)
+        "#,
+    )
+}
+
 fn input() -> RecordBatch {
     RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new(
@@ -236,6 +333,11 @@ fn input() -> RecordBatch {
 fn call_identity(runtime: &Runtime, name: &str) -> anyhow::Result<RecordBatch> {
     let function = runtime.find_function(name, vec![DataType::Int64], DataType::Int64)?;
     runtime.call(&function, &input())
+}
+
+fn call_isolated_identity(runtime: &Runtime, name: &str) -> anyhow::Result<RecordBatch> {
+    let function = runtime.find_function(name, vec![DataType::Int64], DataType::Int64)?;
+    runtime.isolated().call(&function, &input())
 }
 
 fn assert_identity(output: &RecordBatch) {
@@ -416,4 +518,184 @@ fn scalar_output_type_mismatch_is_reported() {
         .unwrap();
     let error = runtime.call(&function, &input()).unwrap_err();
     assert!(error.to_string().contains("output type mismatch"));
+}
+
+#[test]
+fn isolated_calls_restore_memory_globals_tables_and_memory_size() {
+    let binary = isolation_module();
+    let runtime = isolated_builder(&binary, 2)
+        .memory_size_limit(6 * 65_536)
+        .table_elements_limit(2)
+        .build()
+        .unwrap();
+
+    assert_identity(&call_isolated_identity(&runtime, "assert_pristine").unwrap());
+    assert_identity(&call_isolated_identity(&runtime, "mutate_state").unwrap());
+    assert_identity(&call_isolated_identity(&runtime, "assert_pristine").unwrap());
+}
+
+#[test]
+fn isolated_calls_discard_state_after_trap_and_output_validation_failure() {
+    let binary = isolation_module();
+    let runtime = isolated_builder(&binary, 1)
+        .memory_size_limit(6 * 65_536)
+        .table_elements_limit(2)
+        .build()
+        .unwrap();
+
+    assert!(call_isolated_identity(&runtime, "mutate_and_trap").is_err());
+    assert_identity(&call_isolated_identity(&runtime, "assert_pristine").unwrap());
+
+    let wrong_type = runtime
+        .find_function(
+            "mutate_wrong_type",
+            vec![DataType::Int64],
+            DataType::Float64,
+        )
+        .unwrap();
+    let error = runtime.isolated().call(&wrong_type, &input()).unwrap_err();
+    assert!(error.to_string().contains("output type mismatch"));
+    assert_identity(&call_isolated_identity(&runtime, "assert_pristine").unwrap());
+}
+
+#[test]
+fn isolated_calls_reset_fuel_after_failure() {
+    let binary = compute_module();
+    let runtime = isolated_builder(&binary, 1)
+        .fuel_per_call(50_000)
+        .build()
+        .unwrap();
+
+    let forever = runtime
+        .find_function("forever", vec![DataType::Int64], DataType::Int64)
+        .unwrap();
+    let error = runtime.isolated().call(&forever, &input()).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<RuntimeControlError>(),
+        Some(&RuntimeControlError::FuelExhausted)
+    );
+    assert_identity(&call_isolated_identity(&runtime, "finite").unwrap());
+}
+
+#[test]
+fn isolated_calls_reset_deadline_after_timeout() {
+    let binary = compute_module();
+    let runtime = Arc::new(
+        isolated_builder(&binary, 1)
+            .epoch_deadline_ticks(1)
+            .build()
+            .unwrap(),
+    );
+    let controller = runtime.epoch_controller().unwrap();
+    let worker_runtime = Arc::clone(&runtime);
+    let worker = thread::spawn(move || {
+        let forever =
+            worker_runtime.find_function("forever", vec![DataType::Int64], DataType::Int64)?;
+        worker_runtime.isolated().call(&forever, &input())
+    });
+
+    thread::sleep(Duration::from_millis(10));
+    for _ in 0..100 {
+        assert!(controller.increment());
+        if worker.is_finished() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let error = worker
+        .join()
+        .expect("epoch worker must not panic")
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<RuntimeControlError>(),
+        Some(&RuntimeControlError::EpochDeadlineExceeded)
+    );
+    assert_identity(&call_isolated_identity(&runtime, "finite").unwrap());
+}
+
+#[test]
+fn isolated_calls_are_pristine_across_functions_and_concurrent_callers() {
+    let binary = isolation_module();
+    let runtime = Arc::new(
+        isolated_builder(&binary, 8)
+            .memory_size_limit(6 * 65_536)
+            .table_elements_limit(2)
+            .build()
+            .unwrap(),
+    );
+
+    assert_identity(&call_isolated_identity(&runtime, "mutate_state").unwrap());
+    assert_identity(&call_isolated_identity(&runtime, "assert_pristine").unwrap());
+
+    let workers = (0..8)
+        .map(|_| {
+            let runtime = Arc::clone(&runtime);
+            thread::spawn(move || {
+                for _ in 0..16 {
+                    assert_identity(
+                        &call_isolated_identity(&runtime, "assert_then_mutate").unwrap(),
+                    );
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    for worker in workers {
+        worker.join().expect("isolation worker must not panic");
+    }
+}
+
+#[test]
+fn isolated_wasi_random_state_is_fresh_per_call() {
+    let binary = random_module();
+    let runtime = isolated_builder(&binary, 1).build().unwrap();
+
+    assert_identity(&call_isolated_identity(&runtime, "random_deterministic").unwrap());
+    assert_identity(&call_isolated_identity(&runtime, "random_deterministic").unwrap());
+}
+
+#[test]
+fn isolated_pool_preserves_memory_and_table_limits() {
+    let memory = memory_module();
+    let memory_runtime = isolated_builder(&memory, 1)
+        .memory_size_limit(6 * 65_536)
+        .build()
+        .unwrap();
+    assert_identity(&call_isolated_identity(&memory_runtime, "grow_within").unwrap());
+    assert!(call_isolated_identity(&memory_runtime, "grow_exceed").is_err());
+    assert_identity(&call_isolated_identity(&memory_runtime, "grow_within").unwrap());
+
+    let table = table_module();
+    let table_runtime = isolated_builder(&table, 1)
+        .table_elements_limit(3)
+        .build()
+        .unwrap();
+    assert_identity(&call_isolated_identity(&table_runtime, "table_grow_within").unwrap());
+    assert!(call_isolated_identity(&table_runtime, "table_grow_exceed").is_err());
+    assert_identity(&call_isolated_identity(&table_runtime, "table_grow_within").unwrap());
+}
+
+#[test]
+fn isolated_instance_pool_size_must_be_nonzero() {
+    let binary = compute_module();
+    let error = isolated_builder(&binary, 0).build().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("isolated_instance_pool_size must be greater than zero")
+    );
+}
+
+#[test]
+fn isolated_instance_pool_requires_explicit_resource_bounds() {
+    let binary = compute_module();
+    let error = Runtime::builder(&binary)
+        .isolated_instance_pool_size(1)
+        .build()
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("isolated instance pooling requires memory_size_limit")
+    );
 }

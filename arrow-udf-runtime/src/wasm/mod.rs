@@ -38,15 +38,20 @@ use crate::into_field::IntoField;
 pub mod build;
 mod ram_file;
 
+type StoreData = (WasiCtx, StoreLimits);
+
 /// The WASM UDF runtime.
 ///
 /// This runtime contains an instance pool and can be shared by multiple threads.
 pub struct Runtime {
     module: Module,
+    linker: Arc<Linker<StoreData>>,
     /// Configurations.
     config: Config,
     /// Export names of user-defined functions.
     functions: Arc<HashSet<String>>,
+    /// Decoded function signatures and their raw Wasm export names.
+    function_exports: Arc<Vec<(String, String)>>,
     /// User-defined types.
     types: Arc<HashMap<String, String>>,
     /// Instance pool.
@@ -92,6 +97,15 @@ pub struct Config {
     pub wasi: WasiPolicy,
     /// Maximum captured stdout/stderr size in bytes, per stream and instance.
     pub file_size_limit: Option<usize>,
+    /// Capacity of Wasmtime's allocation pool for pristine isolated calls.
+    ///
+    /// `None` keeps Wasmtime's on-demand allocator. A non-zero value enables
+    /// Wasmtime's pooling allocator with bounded memory, table, and instance
+    /// slots. Isolated calls still create a fresh Store, WASI context, and Wasm
+    /// instance; only allocation capacity is reused after Wasmtime restores it.
+    /// Enabling this requires explicit memory-size, memory-count, table-size,
+    /// and table-count limits.
+    pub isolated_instance_pool_size: Option<usize>,
 }
 
 impl Default for Config {
@@ -106,6 +120,7 @@ impl Default for Config {
             epoch_deadline_ticks: None,
             wasi: WasiPolicy::default(),
             file_size_limit: None,
+            isolated_instance_pool_size: None,
         }
     }
 }
@@ -267,6 +282,14 @@ impl<'a> RuntimeBuilder<'a> {
         self
     }
 
+    /// Enable bounded Wasmtime allocation pooling for pristine isolated calls.
+    ///
+    /// The memory and table size/count limits must also be configured.
+    pub fn isolated_instance_pool_size(mut self, size: usize) -> Self {
+        self.config.isolated_instance_pool_size = Some(size);
+        self
+    }
+
     /// Compile the module and create a shareable runtime.
     pub fn build(self) -> Result<Runtime> {
         ensure!(
@@ -277,6 +300,10 @@ impl<'a> RuntimeBuilder<'a> {
             self.config.epoch_deadline_ticks != Some(0),
             "epoch_deadline_ticks must be greater than zero"
         );
+        ensure!(
+            self.config.isolated_instance_pool_size != Some(0),
+            "isolated_instance_pool_size must be greater than zero"
+        );
         #[cfg(not(target_has_atomic = "64"))]
         ensure!(
             self.config.epoch_deadline_ticks.is_none(),
@@ -286,9 +313,58 @@ impl<'a> RuntimeBuilder<'a> {
         let mut engine_config = wasmtime::Config::new();
         engine_config.consume_fuel(self.config.fuel_per_call.is_some());
         engine_config.epoch_interruption(self.config.epoch_deadline_ticks.is_some());
+        configure_isolated_instance_pool(&mut engine_config, &self.config)?;
         let engine = Engine::new(&engine_config).context("failed to create Wasmtime engine")?;
         Runtime::with_config_engine(self.binary, self.config, &engine)
     }
+}
+
+fn configure_isolated_instance_pool(
+    engine_config: &mut wasmtime::Config,
+    config: &Config,
+) -> Result<()> {
+    let Some(capacity) = config.isolated_instance_pool_size else {
+        return Ok(());
+    };
+    let capacity = u32::try_from(capacity).context("isolated instance pool is too large")?;
+    let memory_size_limit = config
+        .memory_size_limit
+        .context("isolated instance pooling requires memory_size_limit")?;
+    let table_elements_limit = config
+        .table_elements_limit
+        .context("isolated instance pooling requires table_elements_limit")?;
+    let memory_count_limit = config
+        .memory_count_limit
+        .context("isolated instance pooling requires memory_count_limit")?;
+    let table_limit = config
+        .table_limit
+        .context("isolated instance pooling requires table_limit")?;
+    let memories_per_module =
+        u32::try_from(memory_count_limit).context("memory count limit does not fit in u32")?;
+    let tables_per_module =
+        u32::try_from(table_limit).context("table count limit does not fit in u32")?;
+    let total_memories = capacity
+        .checked_mul(memories_per_module)
+        .context("isolated instance memory-slot count overflowed")?;
+    let total_tables = capacity
+        .checked_mul(tables_per_module)
+        .context("isolated instance table-slot count overflowed")?;
+
+    let mut pooling = PoolingAllocationConfig::new();
+    pooling
+        .total_core_instances(capacity)
+        .total_memories(total_memories)
+        .max_memories_per_module(memories_per_module)
+        .total_tables(total_tables)
+        .max_tables_per_module(tables_per_module)
+        // Reuse the smallest set of module-affine slots needed for actual
+        // concurrency instead of warming otherwise idle slots over time.
+        .max_unused_warm_slots(0);
+    pooling
+        .max_memory_size(memory_size_limit)
+        .table_elements(table_elements_limit);
+    engine_config.allocation_strategy(pooling);
+    Ok(())
 }
 
 /// Implement `Clone` for `Runtime` so that we can simply `clone` to create a new
@@ -297,8 +373,10 @@ impl Clone for Runtime {
     fn clone(&self) -> Self {
         Self {
             module: self.module.clone(), // this will share the immutable wasm binary
+            linker: Arc::clone(&self.linker),
             config: self.config,
             functions: self.functions.clone(),
+            function_exports: Arc::clone(&self.function_exports),
             types: self.types.clone(),
             instances: Default::default(), // just initialize a new instance pool
             abi_version: self.abi_version,
@@ -340,6 +418,8 @@ impl Runtime {
     /// Create a new UDF runtime from a WASM binary with a customized engine.
     fn with_config_engine(binary: &[u8], config: Config, engine: &Engine) -> Result<Self> {
         let module = Module::from_binary(engine, binary).context("failed to load wasm binary")?;
+        let mut linker = Linker::new(engine);
+        wasi_common::sync::add_to_linker(&mut linker, |(wasi, _)| wasi)?;
 
         // check abi version
         let version = module
@@ -351,11 +431,13 @@ impl Runtime {
         ensure!(major <= 3, "unsupported abi version: {major}.{minor}");
 
         let mut functions = HashSet::new();
+        let mut function_exports = Vec::new();
         let mut types = HashMap::new();
         for export in module.exports() {
             if let Some(encoded) = export.name().strip_prefix("arrowudf_") {
                 let name = base64_decode(encoded).context("invalid symbol")?;
-                functions.insert(name);
+                functions.insert(name.clone());
+                function_exports.push((name, export.name().to_owned()));
             } else if let Some(encoded) = export.name().strip_prefix("arrowudt_") {
                 let meta = base64_decode(encoded).context("invalid symbol")?;
                 let (name, fields) = meta.split_once('=').context("invalid type string")?;
@@ -365,8 +447,10 @@ impl Runtime {
 
         Ok(Self {
             module,
+            linker: Arc::new(linker),
             config,
             functions: functions.into(),
+            function_exports: function_exports.into(),
             types: types.into(),
             instances: Mutex::new(vec![]),
             abi_version: (major, minor),
@@ -397,6 +481,16 @@ impl Runtime {
         self.config.epoch_deadline_ticks.map(|_| EpochController {
             engine: self.module.engine().weak(),
         })
+    }
+
+    /// Return a view that creates a pristine guest instance for every call.
+    ///
+    /// The view never returns a live instance to [`Runtime`]'s ordinary
+    /// instance pool. When configured, Wasmtime's allocator may reuse bounded
+    /// allocation slots after the previous Store and instance have been
+    /// dropped and their guest state has been restored by Wasmtime.
+    pub fn isolated(&self) -> IsolatedRuntime<'_> {
+        IsolatedRuntime { runtime: self }
     }
 
     /// Find a function by name, argument types and return type.
@@ -531,12 +625,20 @@ impl Runtime {
 
     /// Create one host-owned aggregate state.
     pub fn create_aggregate_state(&self, function: &AggregateFunctionHandle) -> Result<Vec<u8>> {
+        self.create_aggregate_state_with_mode(function, InvocationMode::Reusable)
+    }
+
+    fn create_aggregate_state_with_mode(
+        &self,
+        function: &AggregateFunctionHandle,
+        mode: InvocationMode,
+    ) -> Result<Vec<u8>> {
         let input = RecordBatch::try_new_with_options(
             Arc::new(Schema::empty()),
             Vec::new(),
             &RecordBatchOptions::default().with_row_count(Some(1)),
         )?;
-        aggregate_state_from_output(self.call(&function.init, &input)?)
+        aggregate_state_from_output(self.call_with_mode(&function.init, &input, mode)?)
     }
 
     /// Update one aggregate state with a complete Arrow input batch.
@@ -545,6 +647,16 @@ impl Runtime {
         function: &AggregateFunctionHandle,
         state: &[u8],
         input: &RecordBatch,
+    ) -> Result<Vec<u8>> {
+        self.update_aggregate_state_with_mode(function, state, input, InvocationMode::Reusable)
+    }
+
+    fn update_aggregate_state_with_mode(
+        &self,
+        function: &AggregateFunctionHandle,
+        state: &[u8],
+        input: &RecordBatch,
+        mode: InvocationMode,
     ) -> Result<Vec<u8>> {
         ensure!(
             input.num_columns() == function.arguments.len(),
@@ -575,7 +687,7 @@ impl Runtime {
             columns.push(Arc::new(list));
         }
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
-        aggregate_state_from_output(self.call(&function.update, &batch)?)
+        aggregate_state_from_output(self.call_with_mode(&function.update, &batch, mode)?)
     }
 
     /// Merge a batch of partial states into one aggregate state.
@@ -584,6 +696,21 @@ impl Runtime {
         function: &AggregateFunctionHandle,
         state: &[u8],
         partial_states: ArrayRef,
+    ) -> Result<Vec<u8>> {
+        self.merge_aggregate_states_with_mode(
+            function,
+            state,
+            partial_states,
+            InvocationMode::Reusable,
+        )
+    }
+
+    fn merge_aggregate_states_with_mode(
+        &self,
+        function: &AggregateFunctionHandle,
+        state: &[u8],
+        partial_states: ArrayRef,
+        mode: InvocationMode,
     ) -> Result<Vec<u8>> {
         ensure!(
             partial_states.data_type() == &DataType::Binary,
@@ -601,7 +728,7 @@ impl Runtime {
                 Arc::new(states),
             ],
         )?;
-        aggregate_state_from_output(self.call(&function.merge, &batch)?)
+        aggregate_state_from_output(self.call_with_mode(&function.merge, &batch, mode)?)
     }
 
     /// Finalize one or more aggregate states in a single guest invocation.
@@ -609,6 +736,15 @@ impl Runtime {
         &self,
         function: &AggregateFunctionHandle,
         states: ArrayRef,
+    ) -> Result<RecordBatch> {
+        self.finish_aggregate_states_with_mode(function, states, InvocationMode::Reusable)
+    }
+
+    fn finish_aggregate_states_with_mode(
+        &self,
+        function: &AggregateFunctionHandle,
+        states: ArrayRef,
+        mode: InvocationMode,
     ) -> Result<RecordBatch> {
         ensure!(
             states.data_type() == &DataType::Binary,
@@ -623,7 +759,7 @@ impl Runtime {
             )])),
             vec![states],
         )?;
-        self.call(&function.finish, &input)
+        self.call_with_mode(&function.finish, &input, mode)
     }
 
     /// Given a function signature that inlines struct types, find the export function name.
@@ -669,16 +805,29 @@ impl Runtime {
 
     /// Call a function.
     pub fn call(&self, func: &FunctionHandle, input: &RecordBatch) -> Result<RecordBatch> {
+        self.call_with_mode(func, input, InvocationMode::Reusable)
+    }
+
+    fn call_with_mode(
+        &self,
+        func: &FunctionHandle,
+        input: &RecordBatch,
+        mode: InvocationMode,
+    ) -> Result<RecordBatch> {
         let export_name = &func.export_name;
         if !self.functions.contains(export_name) {
             bail!("function not found: {export_name}");
         }
 
-        // get an instance from the pool, or create a new one if the pool is empty
-        let mut instance = if let Some(instance) = self.instances.lock().unwrap().pop() {
-            instance
-        } else {
-            Instance::new(self)?
+        let mut instance = match mode {
+            InvocationMode::Reusable => self
+                .instances
+                .lock()
+                .unwrap()
+                .pop()
+                .map(Ok)
+                .unwrap_or_else(|| Instance::new(self))?,
+            InvocationMode::Isolated => Instance::new(self)?,
         };
 
         instance.reset_call_limits()?;
@@ -691,8 +840,10 @@ impl Runtime {
                 Ok(output)
             });
 
-        // put the instance back to the pool
-        if output.is_ok() {
+        // Only the legacy reusable mode retains successful live instances.
+        // Isolated mode always drops the Store and instance, including after
+        // successful calls and output-validation failures.
+        if output.is_ok() && mode == InvocationMode::Reusable {
             self.instances.lock().unwrap().push(instance);
         }
 
@@ -739,6 +890,76 @@ impl Runtime {
             self.instances.lock().unwrap().push(instance);
         })
         .into_iter())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InvocationMode {
+    Reusable,
+    Isolated,
+}
+
+/// Pristine-call view over a compiled [`Runtime`].
+///
+/// Each method creates a fresh Store, WASI context, and Wasm instance. No live
+/// guest state is shared between calls. When enabled in [`Config`], Wasmtime's
+/// bounded pooling allocator can reuse restored allocation slots underneath
+/// these fresh instances.
+pub struct IsolatedRuntime<'a> {
+    runtime: &'a Runtime,
+}
+
+impl IsolatedRuntime<'_> {
+    /// Call a scalar function in a pristine guest instance.
+    pub fn call(&self, function: &FunctionHandle, input: &RecordBatch) -> Result<RecordBatch> {
+        self.runtime
+            .call_with_mode(function, input, InvocationMode::Isolated)
+    }
+
+    /// Create one aggregate state in a pristine guest instance.
+    pub fn create_aggregate_state(&self, function: &AggregateFunctionHandle) -> Result<Vec<u8>> {
+        self.runtime
+            .create_aggregate_state_with_mode(function, InvocationMode::Isolated)
+    }
+
+    /// Update an aggregate state in a pristine guest instance.
+    pub fn update_aggregate_state(
+        &self,
+        function: &AggregateFunctionHandle,
+        state: &[u8],
+        input: &RecordBatch,
+    ) -> Result<Vec<u8>> {
+        self.runtime.update_aggregate_state_with_mode(
+            function,
+            state,
+            input,
+            InvocationMode::Isolated,
+        )
+    }
+
+    /// Merge aggregate states in a pristine guest instance.
+    pub fn merge_aggregate_states(
+        &self,
+        function: &AggregateFunctionHandle,
+        state: &[u8],
+        partial_states: ArrayRef,
+    ) -> Result<Vec<u8>> {
+        self.runtime.merge_aggregate_states_with_mode(
+            function,
+            state,
+            partial_states,
+            InvocationMode::Isolated,
+        )
+    }
+
+    /// Finalize aggregate states in a pristine guest instance.
+    pub fn finish_aggregate_states(
+        &self,
+        function: &AggregateFunctionHandle,
+        states: ArrayRef,
+    ) -> Result<RecordBatch> {
+        self.runtime
+            .finish_aggregate_states_with_mode(function, states, InvocationMode::Isolated)
     }
 }
 
@@ -799,7 +1020,7 @@ struct Instance {
     // extern "C" fn(ptr: *const u8, len: usize, out: *mut CSlice) -> i32
     functions: HashMap<String, TypedFunc<(u32, u32, u32), i32>>,
     memory: Memory,
-    store: Store<(WasiCtx, StoreLimits)>,
+    store: Store<StoreData>,
     stdout: RamFileRef,
     stderr: RamFileRef,
     fuel_per_call: Option<u64>,
@@ -812,8 +1033,6 @@ impl Instance {
     fn new(rt: &Runtime) -> Result<Self> {
         let module = &rt.module;
         let engine = module.engine();
-        let mut linker = Linker::new(engine);
-        wasi_common::sync::add_to_linker(&mut linker, |(wasi, _)| wasi)?;
 
         // Create a capability-minimized WASI context and put it in a Store.
         // No directories, sockets, environment, arguments, or stdin are inherited.
@@ -867,19 +1086,20 @@ impl Instance {
             store.epoch_deadline_trap();
         }
 
-        let instance = linker
+        let instance = rt
+            .linker
             .instantiate(&mut store, module)
             .map_err(classify_execution_error)
             .context("failed to instantiate WASM UDF module")?;
-        let mut functions = HashMap::new();
-        for export in module.exports() {
-            let Some(encoded) = export.name().strip_prefix("arrowudf_") else {
-                continue;
-            };
-            let name = base64_decode(encoded).context("invalid symbol")?;
-            let func = instance.get_typed_func(&mut store, export.name())?;
-            functions.insert(name, func);
-        }
+        let functions = rt
+            .function_exports
+            .iter()
+            .map(|(name, export)| {
+                instance
+                    .get_typed_func(&mut store, export)
+                    .map(|function| (name.clone(), function))
+            })
+            .collect::<Result<HashMap<_, _>, _>>()?;
         let alloc = instance.get_typed_func(&mut store, "alloc")?;
         let dealloc = instance.get_typed_func(&mut store, "dealloc")?;
         let record_batch_iterator_next =

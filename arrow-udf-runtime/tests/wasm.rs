@@ -173,6 +173,91 @@ fn opaque_aggregate_state_updates_merges_and_finishes_by_batch() {
 }
 
 #[test]
+fn isolated_aggregate_lifecycle_has_pristine_guest_state() {
+    let binary = std::fs::read(BINARY_PATH).expect("failed to load wasm binary");
+    let runtime = Arc::new(
+        Runtime::builder(&binary)
+            .memory_size_limit(64 * 1024 * 1024)
+            .table_elements_limit(100_000)
+            .instance_limit(1)
+            .table_limit(1)
+            .memory_count_limit(1)
+            .isolated_instance_pool_size(8)
+            .build()
+            .unwrap(),
+    );
+    let aggregate = runtime
+        .find_aggregate_function("isolation_probe", vec![DataType::Float64], DataType::Int64)
+        .unwrap();
+    let input = Arc::new(
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Float64,
+                false,
+            )])),
+            vec![Arc::new(Float64Array::from(vec![1.0, 2.0]))],
+        )
+        .unwrap(),
+    );
+
+    let state = runtime
+        .isolated()
+        .create_aggregate_state(&aggregate)
+        .unwrap();
+    assert_eq!(state, vec![0]);
+    let state = runtime
+        .isolated()
+        .update_aggregate_state(&aggregate, &state, &input)
+        .unwrap();
+    let partials = Arc::new(BinaryArray::from(vec![Some(state.as_slice())]));
+    let state = runtime
+        .isolated()
+        .merge_aggregate_states(&aggregate, &state, partials)
+        .unwrap();
+    let states = Arc::new(BinaryArray::from(vec![Some(state.as_slice())]));
+    let output = runtime
+        .isolated()
+        .finish_aggregate_states(&aggregate, states)
+        .unwrap();
+    let values = output
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(values.value(0), 0);
+
+    let workers = (0..8)
+        .map(|_| {
+            let runtime = Arc::clone(&runtime);
+            let input = Arc::clone(&input);
+            std::thread::spawn(move || {
+                let aggregate = runtime
+                    .find_aggregate_function(
+                        "isolation_probe",
+                        vec![DataType::Float64],
+                        DataType::Int64,
+                    )
+                    .unwrap();
+                for _ in 0..16 {
+                    let state = runtime
+                        .isolated()
+                        .create_aggregate_state(&aggregate)
+                        .unwrap();
+                    runtime
+                        .isolated()
+                        .update_aggregate_state(&aggregate, &state, &input)
+                        .unwrap();
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    for worker in workers {
+        worker.join().expect("isolation worker must not panic");
+    }
+}
+
+#[test]
 fn test_division_by_zero() {
     let input = RecordBatch::try_new(
         Arc::new(Schema::new(vec![

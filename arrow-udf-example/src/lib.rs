@@ -14,6 +14,7 @@
 
 use arrow_udf::{function, types::*};
 use std::fmt::Write;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use arrow_udf::codegen::arrow_array::{Array, BinaryArray, Float64Array, ListArray};
 
@@ -251,4 +252,54 @@ fn bench_state_merge_batch(states: &BinaryArray, _partial_states: &ListArray) ->
 #[function("bench_state_finish(binary) -> int64")]
 fn bench_state_finish(state: &[u8]) -> i64 {
     state.len() as i64
+}
+
+// Test-only guest state used to prove that every isolated aggregate lifecycle
+// entry starts from a pristine Wasm instance.
+static ISOLATION_STATE: AtomicU32 = AtomicU32::new(0);
+
+fn dirty_isolation_state() {
+    assert_eq!(
+        ISOLATION_STATE.swap(1, Ordering::SeqCst),
+        0,
+        "aggregate invocation observed guest state from a previous call"
+    );
+}
+
+#[function("isolation_probe_init() -> binary")]
+fn isolation_probe_init() -> Vec<u8> {
+    dirty_isolation_state();
+    vec![0]
+}
+
+#[function(
+    "isolation_probe_update(binary, float64[]) -> binary",
+    batch_fn = "isolation_probe_update_batch"
+)]
+fn isolation_probe_update(_state: &[u8], _values: &[f64]) -> Vec<u8> {
+    unreachable!("isolation probe update uses its vectorized batch function")
+}
+
+fn isolation_probe_update_batch(states: &BinaryArray, _values: &ListArray) -> BinaryArray {
+    dirty_isolation_state();
+    BinaryArray::from(vec![Some(states.value(0))])
+}
+
+#[function(
+    "isolation_probe_merge(binary, binary[]) -> binary",
+    batch_fn = "isolation_probe_merge_batch"
+)]
+fn isolation_probe_merge(_state: &[u8], _partial_states: &BinaryArray) -> Vec<u8> {
+    unreachable!("isolation probe merge uses its vectorized batch function")
+}
+
+fn isolation_probe_merge_batch(states: &BinaryArray, _partial_states: &ListArray) -> BinaryArray {
+    dirty_isolation_state();
+    BinaryArray::from(vec![Some(states.value(0))])
+}
+
+#[function("isolation_probe_finish(binary) -> int64")]
+fn isolation_probe_finish(state: &[u8]) -> i64 {
+    dirty_isolation_state();
+    i64::from(state[0])
 }

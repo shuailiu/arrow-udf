@@ -155,10 +155,13 @@ fn runtime_config() -> Config {
 }
 
 fn runtime(binary: &[u8]) -> Runtime {
-    Runtime::builder(binary)
-        .config(runtime_config())
-        .build()
-        .unwrap()
+    runtime_with_pool(binary, None)
+}
+
+fn runtime_with_pool(binary: &[u8], isolated_instance_pool_size: Option<usize>) -> Runtime {
+    let mut config = runtime_config();
+    config.isolated_instance_pool_size = isolated_instance_pool_size;
+    Runtime::builder(binary).config(config).build().unwrap()
 }
 
 fn measure<T>(mut operation: impl FnMut() -> T) -> Stats {
@@ -443,6 +446,179 @@ fn cold_warm(csv: &mut Csv, binary: &[u8]) {
             invocations: 1,
             errors: 0,
             samples,
+            stats,
+        });
+    }
+}
+
+fn isolated_cold_warm(csv: &mut Csv, binary: &[u8]) {
+    let compile = measure(|| runtime_with_pool(black_box(binary), Some(8)));
+    csv.row(Row {
+        layer: "A",
+        category: "isolated_cold_warm",
+        path: "module_compile_pool8",
+        value_type: "Int64",
+        rows: 0,
+        arguments: 1,
+        concurrency: 8,
+        partial_states: 0,
+        state_bytes: 0,
+        input_bytes: binary.len(),
+        output_bytes: 0,
+        invocations: 0,
+        errors: 0,
+        samples: REPETITIONS,
+        stats: compile,
+    });
+
+    let input = int64_batch(4_096, 1);
+    for (label, pool_size) in [("on_demand", None), ("pool1", Some(1)), ("pool8", Some(8))] {
+        let runtime = runtime_with_pool(binary, pool_size);
+        let function = runtime
+            .find_function("add_one_int64", vec![DataType::Int64], DataType::Int64)
+            .unwrap();
+        let start = Instant::now();
+        black_box(runtime.isolated().call(&function, &input).unwrap());
+        let first = Stats::from_samples(&[start.elapsed().as_nanos()]);
+        let start = Instant::now();
+        black_box(runtime.isolated().call(&function, &input).unwrap());
+        let second = Stats::from_samples(&[start.elapsed().as_nanos()]);
+        let warm = measure(|| runtime.isolated().call(&function, &input).unwrap());
+        for (phase, stats, samples) in [
+            ("first", first, 1),
+            ("second", second, 1),
+            ("warm", warm, REPETITIONS),
+        ] {
+            let path = format!("{label}_{phase}");
+            csv.row(Row {
+                layer: "A",
+                category: "isolated_cold_warm",
+                path: &path,
+                value_type: "Int64",
+                rows: input.num_rows(),
+                arguments: 1,
+                concurrency: pool_size.unwrap_or(1),
+                partial_states: 0,
+                state_bytes: 0,
+                input_bytes: input.get_array_memory_size(),
+                output_bytes: 0,
+                invocations: 1,
+                errors: 0,
+                samples,
+                stats,
+            });
+        }
+    }
+}
+
+fn isolated_lifecycle(csv: &mut Csv, runtime: &Runtime) {
+    let scalar_input = int64_batch(4_096, 1);
+    let scalar = runtime
+        .find_function("add_one_int64", vec![DataType::Int64], DataType::Int64)
+        .unwrap();
+    let scalar_output = runtime.isolated().call(&scalar, &scalar_input).unwrap();
+    let scalar_stats = measure(|| {
+        runtime
+            .isolated()
+            .call(&scalar, black_box(&scalar_input))
+            .unwrap()
+    });
+    csv.row(Row {
+        layer: "A",
+        category: "isolated_scalar",
+        path: "wasm_pool8",
+        value_type: "Int64",
+        rows: scalar_input.num_rows(),
+        arguments: 1,
+        concurrency: 1,
+        partial_states: 0,
+        state_bytes: 0,
+        input_bytes: scalar_input.get_array_memory_size(),
+        output_bytes: scalar_output.get_array_memory_size(),
+        invocations: 1,
+        errors: 0,
+        samples: REPETITIONS,
+        stats: scalar_stats,
+    });
+
+    let aggregate = runtime
+        .find_aggregate_function("sum", vec![DataType::Float64], DataType::Float64)
+        .unwrap();
+    let initial = runtime
+        .isolated()
+        .create_aggregate_state(&aggregate)
+        .unwrap();
+    let input = float64_batch(4_096);
+    let state = runtime
+        .isolated()
+        .update_aggregate_state(&aggregate, &initial, &input)
+        .unwrap();
+    let partials = Arc::new(BinaryArray::from_iter_values(
+        (0..8).map(|_| state.as_slice()),
+    )) as ArrayRef;
+    let states = Arc::new(BinaryArray::from(vec![Some(state.as_slice())])) as ArrayRef;
+    let cases = [
+        (
+            "wasm_init_pool8",
+            0,
+            0,
+            measure(|| {
+                runtime
+                    .isolated()
+                    .create_aggregate_state(&aggregate)
+                    .unwrap()
+            }),
+        ),
+        (
+            "wasm_update_pool8",
+            input.num_rows(),
+            0,
+            measure(|| {
+                runtime
+                    .isolated()
+                    .update_aggregate_state(&aggregate, &initial, black_box(&input))
+                    .unwrap()
+            }),
+        ),
+        (
+            "wasm_merge_pool8",
+            0,
+            8,
+            measure(|| {
+                runtime
+                    .isolated()
+                    .merge_aggregate_states(&aggregate, &initial, Arc::clone(&partials))
+                    .unwrap()
+            }),
+        ),
+        (
+            "wasm_finish_pool8",
+            1,
+            1,
+            measure(|| {
+                runtime
+                    .isolated()
+                    .finish_aggregate_states(&aggregate, Arc::clone(&states))
+                    .unwrap()
+            }),
+        ),
+    ];
+    for (path, rows, partial_states, stats) in cases {
+        csv.row(Row {
+            layer: "A",
+            category: "isolated_aggregate_lifecycle",
+            path,
+            value_type: "Float64",
+            rows,
+            arguments: 1,
+            concurrency: 1,
+            partial_states,
+            state_bytes: state.len(),
+            input_bytes: input.get_array_memory_size(),
+            output_bytes: state.len(),
+            invocations: 1,
+            errors: 0,
+            samples: REPETITIONS,
             stats,
         });
     }
@@ -846,9 +1022,12 @@ fn main() {
     fs::create_dir_all(&output).unwrap();
     let mut csv = Csv::create(&output.join("runtime.csv"));
     cold_warm(&mut csv, &binary);
+    isolated_cold_warm(&mut csv, &binary);
     let runtime = Arc::new(runtime(&binary));
     scalar_matrices(&mut csv, &runtime);
     aggregate_matrices(&mut csv, &runtime);
     concurrent_scalar(&mut csv, Arc::clone(&runtime));
     concurrent_aggregate(&mut csv, runtime);
+    let isolated_runtime = runtime_with_pool(&binary, Some(8));
+    isolated_lifecycle(&mut csv, &isolated_runtime);
 }
